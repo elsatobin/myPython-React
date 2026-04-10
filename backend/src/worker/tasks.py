@@ -1,26 +1,19 @@
 import asyncio
-import os
+from datetime import datetime, timezone
 from pathlib import Path
+
 from celery import Celery
-from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
-from src.models import Alert, StoredFile
-from src.service import STORAGE_DIR, DB_URL
 
-REDIS_URL = os.environ.get("REDIS_URL", "redis://backend-redis:6379/0")
-_worker_loop: asyncio.AbstractEventLoop | None = None
+from src.alerts.models import Alert
+from src.core.config import STORAGE_DIR, settings
+from src.core.database import async_session_maker
+from src.files.models import StoredFile
 
-
-def run_in_worker_loop(coroutine):
-    global _worker_loop
-    if _worker_loop is None or _worker_loop.is_closed():
-        _worker_loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(_worker_loop)
-    return _worker_loop.run_until_complete(coroutine)
-
-
-celery_app = Celery("file_tasks", broker=REDIS_URL, backend=REDIS_URL)
-engine = create_async_engine(DB_URL)
-async_session_maker = async_sessionmaker(engine, expire_on_commit=False)
+celery_app = Celery(
+    "file_tasks",
+    broker=settings.celery_broker_url,
+    backend=settings.celery_broker_url,
+)
 
 
 async def _scan_file_for_threats(file_id: str) -> None:
@@ -30,6 +23,7 @@ async def _scan_file_for_threats(file_id: str) -> None:
             return
 
         file_item.processing_status = "processing"
+        file_item.updated_at = datetime.now(timezone.utc)
         reasons: list[str] = []
         extension = Path(file_item.original_name).suffix.lower()
 
@@ -39,7 +33,10 @@ async def _scan_file_for_threats(file_id: str) -> None:
         if file_item.size > 10 * 1024 * 1024:
             reasons.append("file is larger than 10 MB")
 
-        if extension == ".pdf" and file_item.mime_type not in {"application/pdf", "application/octet-stream"}:
+        if extension == ".pdf" and file_item.mime_type not in {
+            "application/pdf",
+            "application/octet-stream",
+        }:
             reasons.append("pdf extension does not match mime type")
 
         file_item.scan_status = "suspicious" if reasons else "clean"
@@ -61,11 +58,12 @@ async def _extract_file_metadata(file_id: str) -> None:
             file_item.processing_status = "failed"
             file_item.scan_status = file_item.scan_status or "failed"
             file_item.scan_details = "stored file not found during metadata extraction"
+            file_item.updated_at = datetime.now(timezone.utc)
             await session.commit()
             send_file_alert.delay(file_id)
             return
 
-        metadata = {
+        metadata: dict = {
             "extension": Path(file_item.original_name).suffix.lower(),
             "size_bytes": file_item.size,
             "mime_type": file_item.mime_type,
@@ -81,6 +79,7 @@ async def _extract_file_metadata(file_id: str) -> None:
 
         file_item.metadata_json = metadata
         file_item.processing_status = "processed"
+        file_item.updated_at = datetime.now(timezone.utc)
         await session.commit()
 
     send_file_alert.delay(file_id)
@@ -109,14 +108,14 @@ async def _send_file_alert(file_id: str) -> None:
 
 @celery_app.task
 def scan_file_for_threats(file_id: str) -> None:
-    run_in_worker_loop(_scan_file_for_threats(file_id))
+    asyncio.run(_scan_file_for_threats(file_id))
 
 
 @celery_app.task
 def extract_file_metadata(file_id: str) -> None:
-    run_in_worker_loop(_extract_file_metadata(file_id))
+    asyncio.run(_extract_file_metadata(file_id))
 
 
 @celery_app.task
 def send_file_alert(file_id: str) -> None:
-    run_in_worker_loop(_send_file_alert(file_id))
+    asyncio.run(_send_file_alert(file_id))
